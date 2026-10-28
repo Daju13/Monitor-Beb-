@@ -66,7 +66,7 @@ class MainActivity : AppCompatActivity() {
             status.text = ParentService.lastStatus
             btn("Ouvir") { cmd(ParentService.A_LISTEN) }
             btn("Parar de ouvir") { cmd(ParentService.A_STOP) }
-            btn("Silenciar alarme", Color.parseColor("#FF0000") { cmd(ParentService.A_SILENCE) }
+            btn("Silenciar alarme", Color.parseColor("#FF0000")) { cmd(ParentService.A_SILENCE) }
         }
         btn("Encerrar") {
             if (role == "baby") stopService(Intent(this, BabyService::class.java)) else cmd(ParentService.A_QUIT)
