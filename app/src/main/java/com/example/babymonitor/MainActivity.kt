@@ -11,6 +11,9 @@ import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 
+import android.content.res.ColorStateList
+import android.graphics.Color
+
 class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var box: LinearLayout
@@ -30,9 +33,16 @@ class MainActivity : AppCompatActivity() {
         setContentView(box)
     }
 
-    private fun btn(t: String, click: () -> Unit) =
-        box.addView(Button(this).apply { text = t; setOnClickListener { click() } })
-
+    private fun btn(t: String, color: Int? = null, click: () -> Unit) =
+    box.addView(Button(this).apply {
+        text = t
+        color?.let {
+            backgroundTintList = ColorStateList.valueOf(it)
+            setTextColor(Color.WHITE)
+        }
+        setOnClickListener { click() }
+    })
+    
     private fun pick(r: String) {
         role = r
         val p = mutableListOf<String>()
@@ -56,7 +66,7 @@ class MainActivity : AppCompatActivity() {
             status.text = ParentService.lastStatus
             btn("Ouvir") { cmd(ParentService.A_LISTEN) }
             btn("Parar de ouvir") { cmd(ParentService.A_STOP) }
-            btn("Silenciar alarme") { cmd(ParentService.A_SILENCE) }
+            btn("Silenciar alarme", Color.parseColor("#FF0000") { cmd(ParentService.A_SILENCE) }
         }
         btn("Encerrar") {
             if (role == "baby") stopService(Intent(this, BabyService::class.java)) else cmd(ParentService.A_QUIT)
