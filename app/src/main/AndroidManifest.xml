@@ -23,7 +23,7 @@
         android:label="Babá Eletrônica"
         android:theme="@style/Theme.AppCompat.DayNight"
         android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round">
+    >
         
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
