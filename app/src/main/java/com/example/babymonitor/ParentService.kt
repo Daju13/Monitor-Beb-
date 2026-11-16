@@ -42,6 +42,8 @@ class ParentService : Service() {
     @Volatile private var failCount = 0
     @Volatile private var tick = 0L          // última prova de vida do laço de rede
     @Volatile private var quitting = false
+    @Volatile private var joinTries = 0
+    @Volatile private var lastErr = ""
     @Volatile private var out: DataOutputStream? = null
     @Volatile private var goAddr: InetAddress? = null
 
@@ -72,13 +74,13 @@ class ParentService : Service() {
         return START_NOT_STICKY
     }
 
+    @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission", "WakelockTimeout")
     private fun boot() {
         running = true; t0 = SystemClock.elapsedRealtime(); tick = t0
         DeadMan.clear(this)
         wake = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bm:parent").apply { acquire() }
-        @Suppress("DEPRECATION")
         wifiLock = applicationContext.getSystemService(WifiManager::class.java)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "bm:wifi").apply { acquire() }
 
@@ -95,7 +97,7 @@ class ParentService : Service() {
         ch = mgr.initialize(this, mainLooper, null)
         registerReceiver(rx, IntentFilter(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION))
         refreshGroup()
-        io.execute(::linkLoop)
+        io.execute { linkLoop() }
         // Rearma o dead-man enquanto o laço de rede estiver vivo (rearma a cada 5 s, alarme em 30 s).
         hb.scheduleAtFixedRate({
             runCatching { if (SystemClock.elapsedRealtime() - tick < 15_000) DeadMan.arm(this) }
@@ -107,10 +109,13 @@ class ParentService : Service() {
             tick = SystemClock.elapsedRealtime()
             val addr = goAddr
             if (addr == null) {
-                status("Procurando o aparelho do bebê…")
+                status("Procurando o aparelho do bebê… (tentativa ${joinTries + 1})")
                 joinGroup()
                 sleepQuiet(4000)
-                if (goAddr == null) down()
+                if (goAddr == null) {
+                    down()
+                    if (++joinTries % 3 == 0) resetP2p()   // a cada 3 falhas, limpa o estado do Wi-Fi Direct
+                } else joinTries = 0
                 continue
             }
             try { session(addr) } catch (e: Exception) { failCount++ }
@@ -129,7 +134,26 @@ class ParentService : Service() {
         val cfg = WifiP2pConfig.Builder()
             .setNetworkName(Proto.GROUP_SSID).setPassphrase(Proto.GROUP_PASS)
             .enablePersistentMode(false).build()
-        mgr.connect(ch, cfg, null)
+        mgr.connect(ch, cfg, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {}
+            override fun onFailure(r: Int) {
+                val nome = when (r) {
+                    0 -> "erro interno"
+                    1 -> "sem suporte a Wi-Fi Direct"
+                    2 -> "ocupado"
+                    else -> "outro"
+                }
+                lastErr = "Wi-Fi Direct recusou (código $r: $nome)"
+                status(lastErr)
+            }
+        })
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun resetP2p() {
+        runCatching { mgr.cancelConnect(ch, null) }
+        runCatching { mgr.removeGroup(ch, null) }
+        goAddr = null
     }
 
     private fun session(addr: InetAddress) {
@@ -149,7 +173,7 @@ class ParentService : Service() {
                     val f = Proto.read(ins)
                     tick = SystemClock.elapsedRealtime()
                     if (!up) {
-                        up = true; everUp = true; silenced = false; failCount = 0
+                        up = true; everUp = true; lastErr = ""; joinTries = 0; silenced = false; failCount = 0
                         alarm(false); status(if (listening) "Ouvindo" else "Conectado (áudio desligado)")
                     }
                     if (f.type == Proto.T_AUDIO && listening) {
@@ -163,7 +187,7 @@ class ParentService : Service() {
 
     private fun down() {
         up = false
-        status("SEM CONEXÃO com o bebê")
+        status("SEM CONEXÃO com o bebê" + if (lastErr.isNotEmpty()) "\n$lastErr" else "")
         if (running && !silenced && (everUp || SystemClock.elapsedRealtime() - t0 > 15_000)) alarm(true)
     }
 
