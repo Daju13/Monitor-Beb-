@@ -2,21 +2,25 @@ package com.example.babymonitor
 
 import android.annotation.SuppressLint
 import android.app.Service
-import android.content.*
+import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.*
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
-import android.net.wifi.p2p.WifiP2pConfig
-import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.WifiNetworkSpecifier
 import android.os.*
 import java.io.*
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Socket
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
-/** Aparelho dos pais: entra no grupo Wi-Fi Direct, recebe áudio, toca, e dispara alarme se o link cair. */
+/** Aparelho dos pais: entra na rede do bebê (Wi-Fi comum, via WifiNetworkSpecifier), recebe áudio, toca, e alarma se o link cair. */
 class ParentService : Service() {
     companion object {
         const val A_LISTEN = "listen"; const val A_STOP = "stop"; const val A_SILENCE = "silence"; const val A_QUIT = "quit"
@@ -27,8 +31,8 @@ class ParentService : Service() {
     private val io = Executors.newCachedThreadPool()
     private val hb = Executors.newSingleThreadScheduledExecutor()
     private val ui = Handler(Looper.getMainLooper())
-    private lateinit var mgr: WifiP2pManager
-    private lateinit var ch: WifiP2pManager.Channel
+    private val cm by lazy { getSystemService(ConnectivityManager::class.java) }
+    private var cb: ConnectivityManager.NetworkCallback? = null
     private var track: AudioTrack? = null
     private var ringtone: Ringtone? = null
     private var wake: PowerManager.WakeLock? = null
@@ -42,20 +46,10 @@ class ParentService : Service() {
     @Volatile private var failCount = 0
     @Volatile private var tick = 0L          // última prova de vida do laço de rede
     @Volatile private var quitting = false
-    @Volatile private var joinTries = 0
     @Volatile private var lastErr = ""
     @Volatile private var out: DataOutputStream? = null
+    @Volatile private var net: Network? = null
     @Volatile private var goAddr: InetAddress? = null
-
-    private val rx = object : BroadcastReceiver() {
-        @SuppressLint("MissingPermission")
-        override fun onReceive(c: Context, i: Intent) = refreshGroup()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun refreshGroup() = mgr.requestConnectionInfo(ch) { info ->
-        goAddr = if (info.groupFormed && !info.isGroupOwner) info.groupOwnerAddress else null
-    }
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -75,7 +69,7 @@ class ParentService : Service() {
     }
 
     @Suppress("DEPRECATION")
-    @SuppressLint("MissingPermission", "WakelockTimeout")
+    @SuppressLint("WakelockTimeout")
     private fun boot() {
         running = true; t0 = SystemClock.elapsedRealtime(); tick = t0
         DeadMan.clear(this)
@@ -93,10 +87,6 @@ class ParentService : Service() {
             .setBufferSizeInBytes(maxOf(minBuf, Proto.FRAME_BYTES * 10))   // ~200 ms
             .setTransferMode(AudioTrack.MODE_STREAM).build()
 
-        mgr = getSystemService(WifiP2pManager::class.java)
-        ch = mgr.initialize(this, mainLooper, null)
-        registerReceiver(rx, IntentFilter(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION))
-        refreshGroup()
         io.execute { linkLoop() }
         // Rearma o dead-man enquanto o laço de rede estiver vivo (rearma a cada 5 s, alarme em 30 s).
         hb.scheduleAtFixedRate({
@@ -109,55 +99,59 @@ class ParentService : Service() {
             tick = SystemClock.elapsedRealtime()
             val addr = goAddr
             if (addr == null) {
-                status("Procurando o aparelho do bebê… (tentativa ${joinTries + 1})")
-                joinGroup()
-                sleepQuiet(4000)
-                if (goAddr == null) {
-                    down()
-                    if (++joinTries % 3 == 0) resetP2p()   // a cada 3 falhas, limpa o estado do Wi-Fi Direct
-                } else joinTries = 0
+                if (cb == null) requestWifi()
+                sleepQuiet(3000)
+                if (goAddr == null) down()
                 continue
             }
             try { session(addr) } catch (e: Exception) { failCount++ }
             down()
-            if (failCount >= 3) {           // grupo provavelmente obsoleto: refaz do zero
-                runCatching { mgr.removeGroup(ch, null) }
-                goAddr = null; failCount = 0
-            }
+            if (failCount >= 3) { resetNet(); failCount = 0 }   // refaz a conexão do zero
             sleepQuiet(1000)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun joinGroup() {
-        // Ingresso direto com SSID+senha conhecidos: sem diálogo de convite no aparelho do bebê.
-        val cfg = WifiP2pConfig.Builder()
-            .setNetworkName(Proto.GROUP_SSID).setPassphrase(Proto.GROUP_PASS)
-            .enablePersistentMode(false).build()
-        mgr.connect(ch, cfg, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {}
-            override fun onFailure(r: Int) {
-                val nome = when (r) {
-                    0 -> "erro interno"
-                    1 -> "sem suporte a Wi-Fi Direct"
-                    2 -> "ocupado"
-                    else -> "outro"
-                }
-                lastErr = "Wi-Fi Direct recusou (código $r: $nome)"
-                status(lastErr)
+    /** Conecta na rede DIRECT-... do bebê como um Wi-Fi comum. O Android pede confirmação ao usuário. */
+    private fun requestWifi() {
+        resetNet()
+        val spec = WifiNetworkSpecifier.Builder()
+            .setSsid(Proto.GROUP_SSID).setWpa2Passphrase(Proto.GROUP_PASS).build()
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .setNetworkSpecifier(spec).build()
+        val c = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(n: Network) {
+                net = n; goAddr = gatewayOf(cm.getLinkProperties(n))
             }
-        })
+            override fun onLinkPropertiesChanged(n: Network, lp: LinkProperties) {
+                if (n == net) goAddr = gatewayOf(lp)
+            }
+            override fun onLost(n: Network) {
+                if (n == net) { net = null; goAddr = null }
+            }
+            override fun onUnavailable() {
+                lastErr = "Rede do bebê indisponível (recusada ou fora de alcance)"
+                status(lastErr); resetNet()
+            }
+        }
+        cb = c
+        status("Conectando à rede do bebê… (aceite o pedido na tela, se aparecer)")
+        cm.requestNetwork(req, c, 60_000)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun resetP2p() {
-        runCatching { mgr.cancelConnect(ch, null) }
-        runCatching { mgr.removeGroup(ch, null) }
-        goAddr = null
+    private fun gatewayOf(lp: LinkProperties?): InetAddress =
+        lp?.routes?.mapNotNull { it.gateway }?.firstOrNull { it is Inet4Address && !it.isAnyLocalAddress }
+            ?: InetAddress.getByName("192.168.49.1")      // IP padrão do Group Owner no Wi-Fi Direct
+
+    private fun resetNet() {
+        cb?.let { runCatching { cm.unregisterNetworkCallback(it) } }
+        cb = null; net = null; goAddr = null
     }
 
     private fun session(addr: InetAddress) {
-        Socket().use { s ->
+        val n = net ?: throw IOException("sem rede")
+        n.socketFactory.createSocket().use { s ->      // socket preso à rede do bebê
             s.connect(InetSocketAddress(addr, Proto.PORT), 3000)
             s.tcpNoDelay = true
             s.soTimeout = 3000                  // sem quadro (áudio ou heartbeat) por 3 s => exceção => alarme
@@ -173,7 +167,7 @@ class ParentService : Service() {
                     val f = Proto.read(ins)
                     tick = SystemClock.elapsedRealtime()
                     if (!up) {
-                        up = true; everUp = true; lastErr = ""; joinTries = 0; silenced = false; failCount = 0
+                        up = true; everUp = true; lastErr = ""; silenced = false; failCount = 0
                         alarm(false); status(if (listening) "Ouvindo" else "Conectado (áudio desligado)")
                     }
                     if (f.type == Proto.T_AUDIO && listening) {
@@ -187,7 +181,9 @@ class ParentService : Service() {
 
     private fun down() {
         up = false
-        status("SEM CONEXÃO com o bebê" + if (lastErr.isNotEmpty()) "\n$lastErr" else "")
+        val base = if (net == null) "Procurando a rede do bebê… (aceite o pedido na tela, se aparecer)"
+                   else "SEM CONEXÃO com o bebê"
+        status(base + if (lastErr.isNotEmpty()) "\n$lastErr" else "")
         if (running && !silenced && (everUp || SystemClock.elapsedRealtime() - t0 > 15_000)) alarm(true)
     }
 
@@ -228,8 +224,7 @@ class ParentService : Service() {
         running = false
         alarm(false)
         if (quitting) DeadMan.cancel(this)   // se foi o sistema que matou, o dead-man continua armado e dispara
-        runCatching { unregisterReceiver(rx) }
-        runCatching { mgr.removeGroup(ch, null) }
+        resetNet()
         runCatching { track?.release() }
         wake?.release(); wifiLock?.release()
         io.shutdownNow(); hb.shutdownNow()
