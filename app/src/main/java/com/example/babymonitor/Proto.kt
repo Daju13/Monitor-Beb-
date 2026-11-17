@@ -12,6 +12,7 @@ object Proto {
     const val T_BEAT: Byte = 2
     const val T_START: Byte = 3
     const val T_STOP: Byte = 4
+    const val T_BATT: Byte = 5          // payload: [percentual 0-100 (255=desconhecido)][1=carregando]
     const val RATE = 16000
     const val FRAME_BYTES = 640            // 20 ms, PCM16 mono
 

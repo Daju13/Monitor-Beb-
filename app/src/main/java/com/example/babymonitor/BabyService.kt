@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.*
 import android.net.wifi.WifiManager
@@ -99,8 +100,12 @@ class BabyService : Service() {
         val ins = DataInputStream(BufferedInputStream(s.getInputStream()))
         val o = DataOutputStream(BufferedOutputStream(s.getOutputStream()))
         out = o
+        var n = 0
         val beat = hb.scheduleAtFixedRate({
-            try { Proto.write(o, Proto.T_BEAT) } catch (e: IOException) { runCatching { s.close() } }
+            try {
+                Proto.write(o, Proto.T_BEAT)
+                if (n++ % 10 == 0) Proto.write(o, Proto.T_BATT, batteryPayload())   // a cada 10 s
+            } catch (e: IOException) { runCatching { s.close() } }
         }, 0, 1, TimeUnit.SECONDS)
         try {
             while (running) {
@@ -113,6 +118,16 @@ class BabyService : Service() {
         finally {
             beat.cancel(true); stopCapture(); out = null; runCatching { s.close() }
         }
+    }
+
+    private fun batteryPayload(): ByteArray {
+        val i = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))   // broadcast sticky: não exige permissão
+        val level = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+        val st = i?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging = st == BatteryManager.BATTERY_STATUS_CHARGING || st == BatteryManager.BATTERY_STATUS_FULL
+        val pct = if (level >= 0 && scale > 0) level * 100 / scale else 255
+        return byteArrayOf(pct.toByte(), if (charging) 1 else 0)
     }
 
     @SuppressLint("MissingPermission")

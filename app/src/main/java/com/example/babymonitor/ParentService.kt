@@ -1,6 +1,10 @@
 package com.example.babymonitor
 
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -171,6 +175,12 @@ class ParentService : Service() {
                         up = true; everUp = true; lastErr = ""; silenced = false; failCount = 0
                         alarm(false); status(if (listening) "Ouvindo" else "Conectado (áudio desligado)")
                     }
+                    if (f.type == Proto.T_BATT && f.payload.size >= 2) {
+                        val p = f.payload[0].toInt() and 0xFF
+                        battText = if (p == 255) "" else "Bateria do bebê: $p%" + if (f.payload[1].toInt() == 1) " (carregando)" else ""
+                        push()
+                        checkBattery(p, f.payload[1].toInt() == 1)
+                    }
                     if (f.type == Proto.T_AUDIO && listening) {
                         if (ins.available() > Proto.FRAME_BYTES * 25) continue   // >500 ms acumulados: descarta
                         track?.write(f.payload, 0, f.payload.size)
@@ -218,7 +228,44 @@ class ParentService : Service() {
         }
     }
 
-    private fun status(s: String) { lastStatus = s; ui.post { onStatus?.invoke(s) } }
+    // Alertas de bateria do bebê: uma notificação em 15% e outra em 10% (só se não estiver carregando).
+    @Volatile private var notified15 = false
+    @Volatile private var notified10 = false
+
+    private fun checkBattery(p: Int, charging: Boolean) {
+        if (p == 255) return
+        if (charging || p > 20) {                       // recuperou: rearma os alertas e limpa os avisos
+            if (notified15 || notified10) {
+                val nm = getSystemService(NotificationManager::class.java)
+                nm.cancel(10); nm.cancel(11)
+            }
+            notified15 = false; notified10 = false
+            return
+        }
+        if (p <= 10 && !notified10) { notified10 = true; notified15 = true; notifyLow(p) }
+        else if (p in 11..15 && !notified15) { notified15 = true; notifyLow(p) }
+    }
+
+    private fun notifyLow(p: Int) {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel("bm_batt", "Bateria do bebê", NotificationManager.IMPORTANCE_HIGH))
+        val open = PendingIntent.getActivity(this, 5, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        nm.notify(if (p <= 10) 11 else 10, Notification.Builder(this, "bm_batt")
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("Bateria do bebê em $p%")
+            .setContentText("Coloque o aparelho do bebê para carregar.")
+            .setContentIntent(open).setAutoCancel(true).build())
+    }
+
+    @Volatile private var base = ""
+    @Volatile private var battText = ""
+    private fun status(s: String) { base = s; push() }
+    private fun push() {
+        val suffix = if (battText.isEmpty()) "" else "\n" + (if (up) battText else "$battText (última leitura)")
+        val t = base + suffix
+        lastStatus = t
+        ui.post { onStatus?.invoke(t) }
+    }
     private fun sleepQuiet(ms: Long) = try { Thread.sleep(ms) } catch (e: InterruptedException) {}
 
     override fun onDestroy() {
