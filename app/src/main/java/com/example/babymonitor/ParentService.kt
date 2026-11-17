@@ -115,7 +115,8 @@ class ParentService : Service() {
     private fun requestWifi() {
         resetNet()
         val spec = WifiNetworkSpecifier.Builder()
-            .setSsid(Proto.GROUP_SSID).setWpa2Passphrase(Proto.GROUP_PASS).build()
+            .setSsidPattern(PatternMatcher("DIRECT-", PatternMatcher.PATTERN_PREFIX))
+            .setWpa2Passphrase(Proto.GROUP_PASS).build()
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)

@@ -1,6 +1,7 @@
 package com.example.babymonitor
 
 import android.annotation.SuppressLint
+import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -41,11 +42,11 @@ class BabyService : Service() {
         return START_NOT_STICKY
     }
 
+    @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission", "WakelockTimeout")
     private fun boot() {
         wake = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bm:baby").apply { acquire() }
-        @Suppress("DEPRECATION")
         wifiLock = applicationContext.getSystemService(WifiManager::class.java)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "bm:wifi").apply { acquire() }
 
@@ -59,18 +60,30 @@ class BabyService : Service() {
             override fun onSuccess() = createGroup(cfg, 0)
             override fun onFailure(r: Int) = createGroup(cfg, 0)
         })
-        io.execute(::acceptLoop)
+        io.execute { acceptLoop() }
     }
 
     @SuppressLint("MissingPermission")
     private fun createGroup(cfg: WifiP2pConfig, tries: Int) {
         if (!running) return
         mgr.createGroup(ch, cfg, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {}
+            override fun onSuccess() { main.postDelayed({ showGroupInfo() }, 1500) }
             override fun onFailure(r: Int) {
                 if (tries < 10) main.postDelayed({ createGroup(cfg, tries + 1) }, 2000)
+                else note("Falha ao criar a rede (código $r)")
             }
         })
+    }
+
+    private fun note(t: String) =
+        getSystemService(NotificationManager::class.java).notify(1, fgNotification("Babá eletrônica", t))
+
+    /** Mostra na notificação o nome e a senha REAIS da rede (o Android pode ignorar os que pedimos). */
+    @SuppressLint("MissingPermission")
+    private fun showGroupInfo() {
+        mgr.requestGroupInfo(ch) { g ->
+            note(if (g == null) "Rede ainda não criada" else "Rede: ${g.networkName}  Senha: ${g.passphrase}")
+        }
     }
 
     private fun acceptLoop() {
