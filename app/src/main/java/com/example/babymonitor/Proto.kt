@@ -15,6 +15,7 @@ object Proto {
     const val T_BATT: Byte = 5          // payload: [percentual 0-100 (255=desconhecido)][1=carregando]
     const val RATE = 16000
     const val FRAME_BYTES = 640            // 20 ms, PCM16 mono
+    const val CHUNK_FRAMES = 5             // 5 quadros = 100 ms por pacote (50 -> 10 pacotes/s)
 
     // TROQUE ESTES VALORES. SSID deve começar com "DIRECT-xx-"; senha com 8+ caracteres.
     const val GROUP_SSID = "DIRECT-BB-BabaEletronica"

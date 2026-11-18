@@ -88,7 +88,8 @@ class ParentService : Service() {
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
             .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .setSampleRate(Proto.RATE).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
-            .setBufferSizeInBytes(maxOf(minBuf, Proto.FRAME_BYTES * 10))   // ~200 ms
+            .setBufferSizeInBytes(maxOf(minBuf, Proto.FRAME_BYTES * Proto.CHUNK_FRAMES * 4))   // ~400 ms
+            .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_POWER_SAVING)   // caminho deep-buffer do áudio
             .setTransferMode(AudioTrack.MODE_STREAM).build()
 
         io.execute { linkLoop() }

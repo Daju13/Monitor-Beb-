@@ -140,8 +140,8 @@ class BabyService : Service() {
                 .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)   // troque por MIC se ficar baixo
                 .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setSampleRate(Proto.RATE).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
-                .setBufferSizeInBytes(maxOf(min, Proto.FRAME_BYTES * 8)).build()
-            val buf = ByteArray(Proto.FRAME_BYTES)
+                .setBufferSizeInBytes(maxOf(min, Proto.FRAME_BYTES * Proto.CHUNK_FRAMES * 4)).build()
+            val buf = ByteArray(Proto.FRAME_BYTES * Proto.CHUNK_FRAMES)
             try {
                 rec.startRecording()
                 while (streaming) {
