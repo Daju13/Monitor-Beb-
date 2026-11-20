@@ -21,6 +21,7 @@ import java.io.*
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -51,6 +52,9 @@ class ParentService : Service() {
     @Volatile private var tick = 0L          // última prova de vida do laço de rede
     @Volatile private var quitting = false
     @Volatile private var lastErr = ""
+    @Volatile private var downSince = 0L
+    @Volatile private var drops = 0
+    @Volatile private var lastDrop = ""
     @Volatile private var out: DataOutputStream? = null
     @Volatile private var net: Network? = null
     @Volatile private var goAddr: InetAddress? = null
@@ -109,7 +113,10 @@ class ParentService : Service() {
                 if (goAddr == null) down()
                 continue
             }
-            try { session(addr) } catch (e: Exception) { failCount++ }
+            try { session(addr) } catch (e: Exception) {
+                failCount++
+                if (up) { drops++; lastDrop = describe(e) }   // só conta quedas de um link que estava de pé
+            }
             down()
             if (failCount >= 3) { resetNet(); failCount = 0 }   // refaz a conexão do zero
             sleepQuiet(1000)
@@ -160,7 +167,7 @@ class ParentService : Service() {
         n.socketFactory.createSocket().use { s ->      // socket preso à rede do bebê
             s.connect(InetSocketAddress(addr, Proto.PORT), 3000)
             s.tcpNoDelay = true
-            s.soTimeout = 3000                  // sem quadro (áudio ou heartbeat) por 3 s => exceção => alarme
+            s.soTimeout = Proto.READ_TIMEOUT_MS   // sem quadro (áudio ou heartbeat) por 6 s => exceção
             val ins = DataInputStream(BufferedInputStream(s.getInputStream(), 16384))
             val o = DataOutputStream(BufferedOutputStream(s.getOutputStream()))
             out = o
@@ -173,7 +180,7 @@ class ParentService : Service() {
                     val f = Proto.read(ins)
                     tick = SystemClock.elapsedRealtime()
                     if (!up) {
-                        up = true; everUp = true; lastErr = ""; silenced = false; failCount = 0
+                        up = true; everUp = true; downSince = 0L; lastErr = ""; silenced = false; failCount = 0
                         alarm(false); status(if (listening) "Ouvindo" else "Conectado (áudio desligado)")
                     }
                     if (f.type == Proto.T_BATT && f.payload.size >= 2) {
@@ -191,12 +198,23 @@ class ParentService : Service() {
         }
     }
 
+    private fun describe(e: Exception): String {
+        val why = when (e) {
+            is SocketTimeoutException -> "sem dados por ${Proto.READ_TIMEOUT_MS / 1000} s"
+            is EOFException -> "bebê encerrou a conexão"
+            else -> e.message ?: e.javaClass.simpleName
+        }
+        return java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date()) + " " + why
+    }
+
     private fun down() {
         up = false
+        val now = SystemClock.elapsedRealtime()
+        if (downSince == 0L) downSince = now
         val base = if (net == null) "Procurando a rede do bebê… (aceite o pedido na tela, se aparecer)"
                    else "SEM CONEXÃO com o bebê"
         status(base + if (lastErr.isNotEmpty()) "\n$lastErr" else "")
-        if (running && !silenced && (everUp || SystemClock.elapsedRealtime() - t0 > 15_000)) alarm(true)
+        if (running && !silenced && (everUp || now - t0 > 15_000) && now - downSince >= Proto.ALARM_GRACE_MS) alarm(true)
     }
 
     private fun setListening(on: Boolean) {
@@ -263,7 +281,8 @@ class ParentService : Service() {
     private fun status(s: String) { base = s; push() }
     private fun push() {
         val suffix = if (battText.isEmpty()) "" else "\n" + (if (up) battText else "$battText (última leitura)")
-        val t = base + suffix
+        val dropTxt = if (drops > 0) "\nQuedas de link: $drops (última: $lastDrop)" else ""
+        val t = base + suffix + dropTxt
         lastStatus = t
         ui.post { onStatus?.invoke(t) }
     }

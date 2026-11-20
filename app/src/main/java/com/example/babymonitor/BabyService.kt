@@ -32,6 +32,7 @@ class BabyService : Service() {
     @Volatile private var running = false
     @Volatile private var streaming = false
     @Volatile private var out: DataOutputStream? = null
+    @Volatile private var current: Socket? = null
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -90,13 +91,18 @@ class BabyService : Service() {
     private fun acceptLoop() {
         try {
             server = ServerSocket().apply { reuseAddress = true; bind(InetSocketAddress(Proto.PORT)) }
-            while (running) handle(server!!.accept())
+            while (running) {
+                val s = server!!.accept()
+                current?.let { runCatching { it.close() } }   // cliente novo substitui o antigo na hora
+                current = s
+                io.execute { handle(s) }
+            }
         } catch (e: IOException) { /* encerrando */ }
     }
 
     private fun handle(s: Socket) {
         s.tcpNoDelay = true
-        s.soTimeout = 5000                     // pais sem heartbeat por 5 s => derruba
+        s.soTimeout = Proto.READ_TIMEOUT_MS * 2   // pais sem heartbeat por 12 s => derruba
         val ins = DataInputStream(BufferedInputStream(s.getInputStream()))
         val o = DataOutputStream(BufferedOutputStream(s.getOutputStream()))
         out = o
@@ -116,7 +122,9 @@ class BabyService : Service() {
             }
         } catch (e: IOException) { /* desconexão/timeout */ }
         finally {
-            beat.cancel(true); stopCapture(); out = null; runCatching { s.close() }
+            beat.cancel(true)
+            if (current === s) { stopCapture(); out = null; current = null }   // não mexe no estado do cliente novo
+            runCatching { s.close() }
         }
     }
 
