@@ -12,6 +12,7 @@ object Proto {
     const val T_BEAT: Byte = 2
     const val T_START: Byte = 3
     const val T_STOP: Byte = 4
+    const val T_VOX: Byte = 6           // payload: [modo 0=desligado,1=alta,2=média,3=baixa]
     const val T_BATT: Byte = 5          // payload: [percentual 0-100 (255=desconhecido)][1=carregando]
     const val RATE = 16000
     const val FRAME_BYTES = 640            // 20 ms, PCM16 mono
@@ -19,9 +20,6 @@ object Proto {
     const val READ_TIMEOUT_MS = 6000       // pais: sem quadro por 6 s => link considerado caído
     const val ALARM_GRACE_MS = 6000        // pais: link caído por 6 s seguidos => toca o alarme (~12 s no total)
 
-    // TROQUE ESTES VALORES. SSID deve começar com "DIRECT-xx-"; senha com 8+ caracteres.
-    const val GROUP_SSID = "DIRECT-BB-BabaEletronica"
-    const val GROUP_PASS = "troque-esta-senha-123"
 
     class Frame(val type: Byte, val payload: ByteArray)
 

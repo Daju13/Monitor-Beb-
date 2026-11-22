@@ -55,7 +55,7 @@ class BabyService : Service() {
         mgr = getSystemService(WifiP2pManager::class.java)
         ch = mgr.initialize(this, mainLooper, null)
         val cfg = WifiP2pConfig.Builder()
-            .setNetworkName(Proto.GROUP_SSID).setPassphrase(Proto.GROUP_PASS)
+            .setNetworkName(Config.ssid(this)).setPassphrase(Config.pass(this))
             .setGroupOperatingBand(WifiP2pConfig.GROUP_OWNER_BAND_2GHZ)   // melhor penetração/alcance
             .enablePersistentMode(false).build()
         mgr.removeGroup(ch, object : WifiP2pManager.ActionListener {
@@ -115,9 +115,11 @@ class BabyService : Service() {
         }, 0, 1, TimeUnit.SECONDS)
         try {
             while (running) {
-                when (Proto.read(ins).type) {
+                val f = Proto.read(ins)
+                when (f.type) {
                     Proto.T_START -> startCapture(s)
                     Proto.T_STOP -> stopCapture()
+                    Proto.T_VOX -> if (f.payload.isNotEmpty()) voxMode = f.payload[0].toInt().coerceIn(0, 3)
                 }
             }
         } catch (e: IOException) { /* desconexão/timeout */ }
@@ -126,6 +128,45 @@ class BabyService : Service() {
             if (current === s) { stopCapture(); out = null; current = null }   // não mexe no estado do cliente novo
             runCatching { s.close() }
         }
+    }
+
+    // ---------------- VOX: só envia áudio quando há som ----------------
+    @Volatile private var voxMode = 0                       // 0 desligado, 1 alta, 2 média, 3 baixa
+    private val voxFactor = doubleArrayOf(0.0, 2.0, 3.0, 5.0)   // limiar = piso de ruído x fator
+    private val voxMin = intArrayOf(0, 60, 100, 200)            // limiar mínimo absoluto (RMS PCM16)
+    private var floor = 50.0                                    // piso de ruído estimado (adaptativo)
+    private var hangUntil = 0L                                  // continua enviando até este instante
+    private val preroll = ArrayDeque<ByteArray>()               // 200 ms antes do disparo
+
+    private fun send(b: ByteArray) { out?.let { Proto.write(it, Proto.T_AUDIO, b) } }
+
+    private fun emit(buf: ByteArray) {
+        val mode = voxMode
+        if (mode == 0) { preroll.clear(); send(buf); return }
+        val level = rms(buf)
+        val now = SystemClock.elapsedRealtime()
+        val thr = maxOf(floor * voxFactor[mode], voxMin[mode].toDouble())
+        if (level > thr) {
+            if (now >= hangUntil) { while (preroll.isNotEmpty()) send(preroll.removeFirst()) }   // não corta o início
+            hangUntil = now + 4000                                                               // 4 s de margem após o som
+        }
+        if (now < hangUntil) {
+            send(buf)
+        } else {
+            floor = (if (level < floor) 0.8 * floor + 0.2 * level else 0.98 * floor + 0.02 * level).coerceAtLeast(5.0)
+            preroll.addLast(buf.copyOf()); while (preroll.size > 2) preroll.removeFirst()
+        }
+    }
+
+    private fun rms(b: ByteArray): Int {
+        var sum = 0L
+        var i = 0
+        while (i + 1 < b.size) {
+            val s = ((b[i + 1].toInt() shl 8) or (b[i].toInt() and 0xFF)).toShort().toInt()   // PCM16 little-endian
+            sum += s * s
+            i += 2
+        }
+        return Math.sqrt(sum.toDouble() / (b.size / 2)).toInt()
     }
 
     private fun batteryPayload(): ByteArray {
@@ -159,7 +200,7 @@ class BabyService : Service() {
                         if (n < 0) throw IOException("AudioRecord erro $n")
                         off += n
                     }
-                    if (streaming) out?.let { Proto.write(it, Proto.T_AUDIO, buf) }
+                    if (streaming) emit(buf)
                 }
             } catch (e: Exception) { runCatching { s.close() } }
             finally { runCatching { rec.stop() }; rec.release(); streaming = false }

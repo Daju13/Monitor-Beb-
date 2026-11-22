@@ -15,6 +15,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.*
 import java.io.*
@@ -28,7 +29,7 @@ import java.util.concurrent.TimeUnit
 /** Aparelho dos pais: entra na rede do bebê (Wi-Fi comum, via WifiNetworkSpecifier), recebe áudio, toca, e alarma se o link cair. */
 class ParentService : Service() {
     companion object {
-        const val A_LISTEN = "listen"; const val A_STOP = "stop"; const val A_SILENCE = "silence"; const val A_QUIT = "quit"
+        const val A_LISTEN = "listen"; const val A_STOP = "stop"; const val A_SILENCE = "silence"; const val A_QUIT = "quit"; const val A_VOX = "vox"
         @Volatile var onStatus: ((String) -> Unit)? = null
         @Volatile var lastStatus = "Iniciando…"
     }
@@ -55,6 +56,11 @@ class ParentService : Service() {
     @Volatile private var downSince = 0L
     @Volatile private var drops = 0
     @Volatile private var lastDrop = ""
+    @Volatile private var vox = 0
+    @Volatile private var soundNow = false
+    @Volatile private var trackPlaying = false
+    @Volatile private var lastAudioAt = 0L
+    @Volatile private var rssi: Int? = null
     @Volatile private var out: DataOutputStream? = null
     @Volatile private var net: Network? = null
     @Volatile private var goAddr: InetAddress? = null
@@ -72,6 +78,7 @@ class ParentService : Service() {
             A_LISTEN -> setListening(true)
             A_STOP -> setListening(false)
             A_SILENCE -> { silenced = true; alarm(false) }
+            A_VOX -> sendVox()
         }
         return START_NOT_STICKY
     }
@@ -81,6 +88,7 @@ class ParentService : Service() {
     private fun boot() {
         running = true; t0 = SystemClock.elapsedRealtime(); tick = t0
         DeadMan.clear(this)
+        vox = Config.voxMode(this)
         wake = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bm:parent").apply { acquire() }
         wifiLock = applicationContext.getSystemService(WifiManager::class.java)
@@ -100,6 +108,7 @@ class ParentService : Service() {
         // Rearma o dead-man enquanto o laço de rede estiver vivo (rearma a cada 5 s, alarme em 30 s).
         hb.scheduleAtFixedRate({
             runCatching { if (SystemClock.elapsedRealtime() - tick < 15_000) DeadMan.arm(this) }
+            runCatching { net?.let { n -> val r = rssiOf(cm.getNetworkCapabilities(n)); if (r != rssi) { rssi = r; push() } } }
         }, 0, 5, TimeUnit.SECONDS)
     }
 
@@ -128,7 +137,7 @@ class ParentService : Service() {
         resetNet()
         val spec = WifiNetworkSpecifier.Builder()
             .setSsidPattern(PatternMatcher("DIRECT-", PatternMatcher.PATTERN_PREFIX))
-            .setWpa2Passphrase(Proto.GROUP_PASS).build()
+            .setWpa2Passphrase(Config.pass(this)).build()
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
@@ -137,11 +146,14 @@ class ParentService : Service() {
             override fun onAvailable(n: Network) {
                 net = n; goAddr = gatewayOf(cm.getLinkProperties(n))
             }
+            override fun onCapabilitiesChanged(n: Network, nc: NetworkCapabilities) {
+                if (n == net) { rssi = rssiOf(nc); push() }
+            }
             override fun onLinkPropertiesChanged(n: Network, lp: LinkProperties) {
                 if (n == net) goAddr = gatewayOf(lp)
             }
             override fun onLost(n: Network) {
-                if (n == net) { net = null; goAddr = null }
+                if (n == net) { net = null; goAddr = null; rssi = null }
             }
             override fun onUnavailable() {
                 lastErr = "Rede do bebê indisponível (recusada ou fora de alcance)"
@@ -159,7 +171,7 @@ class ParentService : Service() {
 
     private fun resetNet() {
         cb?.let { runCatching { cm.unregisterNetworkCallback(it) } }
-        cb = null; net = null; goAddr = null
+        cb = null; net = null; goAddr = null; rssi = null
     }
 
     private fun session(addr: InetAddress) {
@@ -171,6 +183,7 @@ class ParentService : Service() {
             val ins = DataInputStream(BufferedInputStream(s.getInputStream(), 16384))
             val o = DataOutputStream(BufferedOutputStream(s.getOutputStream()))
             out = o
+            Proto.write(o, Proto.T_VOX, byteArrayOf(vox.toByte()))
             if (listening) Proto.write(o, Proto.T_START)
             val beat = hb.scheduleAtFixedRate({
                 try { Proto.write(o, Proto.T_BEAT) } catch (e: IOException) { runCatching { s.close() } }
@@ -181,7 +194,7 @@ class ParentService : Service() {
                     tick = SystemClock.elapsedRealtime()
                     if (!up) {
                         up = true; everUp = true; downSince = 0L; lastErr = ""; silenced = false; failCount = 0
-                        alarm(false); status(if (listening) "Ouvindo" else "Conectado (áudio desligado)")
+                        alarm(false); status(linkText())
                     }
                     if (f.type == Proto.T_BATT && f.payload.size >= 2) {
                         val p = f.payload[0].toInt() and 0xFF
@@ -191,7 +204,14 @@ class ParentService : Service() {
                     }
                     if (f.type == Proto.T_AUDIO && listening) {
                         if (ins.available() > Proto.FRAME_BYTES * 25) continue   // >500 ms acumulados: descarta
+                        lastAudioAt = SystemClock.elapsedRealtime()
+                        if (!trackPlaying) { track?.play(); trackPlaying = true }
+                        if (!soundNow) { soundNow = true; if (vox != 0) status(linkText()) }
                         track?.write(f.payload, 0, f.payload.size)
+                    } else if (vox != 0 && trackPlaying && SystemClock.elapsedRealtime() - lastAudioAt > 1500) {
+                        // VOX em silêncio: stop() toca o que já está no buffer e depois deixa o áudio do aparelho dormir
+                        track?.stop(); trackPlaying = false
+                        if (soundNow) { soundNow = false; status(linkText()) }
                     }
                 }
             } finally { beat.cancel(true); out = null }
@@ -219,11 +239,11 @@ class ParentService : Service() {
 
     private fun setListening(on: Boolean) {
         listening = on
-        if (on) track?.play() else { track?.pause(); track?.flush() }
+        if (!on) { track?.pause(); track?.flush(); trackPlaying = false; soundNow = false }   // ao ouvir, o play() vem com o 1º áudio
         io.execute {
             try { out?.let { Proto.write(it, if (on) Proto.T_START else Proto.T_STOP) } } catch (e: IOException) {}
         }
-        if (up) status(if (on) "Ouvindo" else "Conectado (áudio desligado)")
+        if (up) status(linkText())
     }
 
     private fun alarm(on: Boolean) {
@@ -245,6 +265,33 @@ class ParentService : Service() {
                 ringtone?.stop(); vib.cancel()
             }
         }
+    }
+
+    private fun sendVox() {
+        vox = Config.voxMode(this)
+        if (vox == 0) soundNow = false
+        io.execute {
+            try { out?.let { Proto.write(it, Proto.T_VOX, byteArrayOf(vox.toByte())) } } catch (e: IOException) {}
+        }
+        if (up) status(linkText())
+    }
+
+    private fun linkText(): String = when {
+        !listening -> "Conectado (áudio desligado)"
+        vox != 0 -> "Ouvindo (VOX: " + (if (soundNow) "som" else "silêncio") + ")"
+        else -> "Ouvindo"
+    }
+
+    private fun rssiOf(nc: NetworkCapabilities?): Int? {
+        val r = (nc?.transportInfo as? WifiInfo)?.rssi ?: nc?.signalStrength
+        return if (r == null || r <= -127 || r == Int.MIN_VALUE) null else r
+    }
+
+    private fun bars(r: Int) = when {
+        r >= -55 -> "▂▄▆█ excelente"
+        r >= -65 -> "▂▄▆▁ bom"
+        r >= -75 -> "▂▄▁▁ regular"
+        else -> "▂▁▁▁ fraco"
     }
 
     // Alertas de bateria do bebê: uma notificação em 15% e outra em 10% (só se não estiver carregando).
@@ -282,7 +329,9 @@ class ParentService : Service() {
     private fun push() {
         val suffix = if (battText.isEmpty()) "" else "\n" + (if (up) battText else "$battText (última leitura)")
         val dropTxt = if (drops > 0) "\nQuedas de link: $drops (última: $lastDrop)" else ""
-        val t = base + suffix + dropTxt
+        val r = rssi
+        val sig = if (net != null && r != null) "\nSinal Wi-Fi: ${bars(r)} ($r dBm)" else ""
+        val t = base + suffix + sig + dropTxt
         lastStatus = t
         ui.post { onStatus?.invoke(t) }
     }
