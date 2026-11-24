@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write   # necessário para criar a release
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,10 +25,24 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Assemble debug APK
-        run: gradle assembleDebug --stacktrace
+      - name: Restaurar keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.keystore"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: babymonitor-beta-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Compilar APK assinado
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle assembleRelease -PversionCode=${{ github.run_number }} -PgithubRepo=${{ github.repository }} --stacktrace
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk babymonitor.apk
+          gh release create "v${{ github.run_number }}" babymonitor.apk \
+            --target "${{ github.sha }}" \
+            --title "v${{ github.run_number }}" \
+            --notes "${COMMIT_MSG:-Build automático #${{ github.run_number }}}"
