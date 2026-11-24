@@ -12,7 +12,9 @@ import android.provider.Settings
 import android.text.InputType
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
@@ -21,6 +23,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var passEt: EditText
     private lateinit var voxBtn: Button
     private var role = ""
+    private var pendingApk: File? = null
 
     private val askPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
         if (r.values.all { it }) launchRole() else status.text = "Permissões necessárias negadas."
@@ -29,7 +32,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
-        status = TextView(this).apply { textSize = 18f; text = "Escolha a função deste aparelho" }
+        status = TextView(this).apply { textSize = 18f; text = "Escolha a função deste aparelho\nVersão instalada: v${Updater.installedCode(this@MainActivity)}" }
         box.addView(status)
         box.addView(label("Nome da rede (letras e números; vale no aparelho do bebê)"))
         nameEt = EditText(this).apply {
@@ -44,7 +47,9 @@ class MainActivity : AppCompatActivity() {
         box.addView(passEt)
         btn("Este aparelho é o BEBÊ") { pick("baby") }
         btn("Este aparelho é dos PAIS") { pick("parent") }
+        btn("Buscar atualização") { checkUpdate(true) }
         setContentView(ScrollView(this).apply { addView(box) })
+        checkUpdate(false)
     }
 
     private fun label(t: String) = TextView(this).apply { text = t; textSize = 13f; setPadding(0, 24, 0, 0) }
@@ -104,6 +109,56 @@ class MainActivity : AppCompatActivity() {
         btn("Encerrar") {
             if (role == "baby") stopService(Intent(this, BabyService::class.java)) else cmd(ParentService.A_QUIT)
             finish()
+        }
+    }
+
+    // ---------------- Atualização via GitHub Releases ----------------
+    private fun checkUpdate(manual: Boolean) {
+        Thread {
+            val info = try { Updater.check(this) } catch (e: Exception) { null }
+            runOnUiThread {
+                if (info != null) askUpdate(info)
+                else if (manual) status.text = "Nenhuma atualização encontrada (ou sem internet)."
+            }
+        }.start()
+    }
+
+    private fun askUpdate(info: Updater.Info) {
+        val notes = info.notes.trim().take(300)
+        AlertDialog.Builder(this)
+            .setTitle("Atualização disponível (${info.tag})")
+            .setMessage((if (notes.isEmpty()) "" else notes + "\n\n") + "Atualizar agora?")
+            .setPositiveButton("Sim") { _, _ -> startDownload(info) }
+            .setNegativeButton("Não", null)
+            .show()
+    }
+
+    private fun startDownload(info: Updater.Info) {
+        status.text = "Baixando atualização… 0%"
+        Thread {
+            try {
+                val f = Updater.download(this, info) { p -> runOnUiThread { status.text = "Baixando atualização… $p%" } }
+                runOnUiThread { status.text = "Download concluído."; installOrAskPermission(f) }
+            } catch (e: Exception) {
+                runOnUiThread { status.text = "Falha no download: ${e.message}" }
+            }
+        }.start()
+    }
+
+    private fun installOrAskPermission(f: File) {
+        if (packageManager.canRequestPackageInstalls()) {
+            Updater.install(this, f)
+        } else {
+            pendingApk = f
+            status.text = "Permita instalar apps desta fonte e volte ao app para concluir."
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        pendingApk?.let {
+            if (packageManager.canRequestPackageInstalls()) { pendingApk = null; Updater.install(this, it) }
         }
     }
 
